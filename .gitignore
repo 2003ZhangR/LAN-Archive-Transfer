@@ -1,3 +1,8 @@
 student_status/
 README.md
 __pycache__/
+.venv/
+test/artifacts/
+requirements.txt
+test/
+接收作业/

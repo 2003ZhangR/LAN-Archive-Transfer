@@ -390,6 +390,22 @@ def _request_json(ip: str, port: int, path: str, headers: dict | None = None) ->
         connection.close()
 
 
+def check_receiver(receiver_ip: str, *, port: int = PORT, require_status: bool = False) -> dict:
+    """供图形界面连接检查使用，不上传文件，也不启动监控。"""
+    ip = validate_ip(receiver_ip)
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise TransferError("接收端口无效。")
+    try:
+        health = _request_json(ip, port, "/health")
+    except (OSError, http.client.HTTPException) as exc:
+        raise TransferError("无法连接教师电脑，请检查 IP、局域网和教师端接收服务（TCP 9000）。") from exc
+    if health.get("protocol") != PROTOCOL:
+        raise TransferError("该地址不是兼容的教师接收端，请核对 IP 和程序版本。")
+    if require_status and STATUS_FEATURE not in health.get("features", []):
+        raise TransferError("教师端尚不支持监控日志，请将 upload.py 和 monitoring.py 一起更新。")
+    return health
+
+
 def _check_receipt(result: dict, metadata: Submission) -> dict:
     if (result.get("size") != metadata.size or not isinstance(result.get("sha256"), str)
             or not hmac.compare_digest(result["sha256"], metadata.sha256)):

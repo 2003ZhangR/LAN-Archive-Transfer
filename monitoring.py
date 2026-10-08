@@ -518,9 +518,12 @@ class ActivityMonitor:
         self.thread = None
         self.error = None
         self.started = False
+        self.save_lock = threading.Lock()
 
     def save(self):
-        atomic_hidden_write(self.path, self.session.encode(self.backend.dropped_events))
+        # GUI 提交快照与定期保存可能同时发生，序列化快照和落盘，避免旧快照晚写覆盖。
+        with self.save_lock:
+            atomic_hidden_write(self.path, self.session.encode(self.backend.dropped_events))
 
     def _sample(self):
         for name, kind in self.backend.operations():
