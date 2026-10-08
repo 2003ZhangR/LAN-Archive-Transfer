@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -25,7 +25,7 @@ try:
 except ImportError:
     raise SystemExit("缺少 PySide6，请先执行：python -m pip install -r requirements.txt")
 
-from monitoring import ActivityMonitor, NOTICE
+from monitoring import ActivityMonitor, NOTICE, utc_now
 from upload import (
     Progress, TransferError, UploadCancelled, check_receiver, format_size,
     upload_file, validate_ip, validate_open_file, validate_student_account,
@@ -40,6 +40,7 @@ MONITOR_NOTICE = NOTICE + "\n不记录具体按键内容、窗口标题、网址
 class StudentSession:
     account: str
     receiver_ip: str
+    login_at: str = field(default_factory=utc_now)
 
 
 def enter_student_session(receiver_ip: str, account: str, password: str) -> StudentSession:
@@ -369,7 +370,7 @@ class StudentWindow(QMainWindow):
             self.monitor = None
             self.consent.setChecked(False)
             self.monitor_status.setText("● 监控已停止")
-            self.monitor_details.setText("日志已保存。再次启用监控将开始新的监控会话。")
+            self.monitor_details.setText("日志已保存。再次启用监控会追加新会话，已有记录继续保留。")
             self.upload_status.setText("监控已停止；重新启用后可以继续上传作业。")
             self._record("监控已停止，日志已保存。")
         elif name == "upload":
@@ -403,11 +404,12 @@ class StudentWindow(QMainWindow):
     def _start_monitor(self):
         if not self.start_monitor_button.isEnabled():
             return
-        factory, account = self.monitor_factory, self.session.account
+        factory, session = self.monitor_factory, self.session
         warning = self.warning_bridge.warning.emit
 
         def start(progress):
-            monitor = factory(account, log_dir=BASE_DIR / "student_status", warning=warning)
+            monitor = factory(session.account, log_dir=BASE_DIR / "student_status", warning=warning,
+                              login_at=session.login_at, receiver_ip=session.receiver_ip)
             monitor.start(consent=True)
             return monitor
 

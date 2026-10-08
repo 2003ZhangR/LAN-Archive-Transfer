@@ -146,6 +146,7 @@ PROTOCOL = "lan-archive/3"
 
 
 STATUS_FEATURE = "programming-status-v1"
+HISTORY_FEATURE = "programming-status-history-v1"
 
 
 STATUS_HASH_HEADER = "X-Programming-Status-SHA256"
@@ -403,6 +404,8 @@ def check_receiver(receiver_ip: str, *, port: int = PORT, require_status: bool =
         raise TransferError("该地址不是兼容的教师接收端，请核对 IP 和程序版本。")
     if require_status and STATUS_FEATURE not in health.get("features", []):
         raise TransferError("教师端尚不支持监控日志，请将 upload.py 和 monitoring.py 一起更新。")
+    if require_status and HISTORY_FEATURE not in health.get("features", []):
+        raise TransferError("教师端尚不支持监控历史与登录信息，请将 upload.py 和 monitoring.py 一起更新。")
     return health
 
 
@@ -506,6 +509,7 @@ def upload_file(file_path: str | Path, student_account: str, receiver_ip: str, *
     size, attempt, done = 0, 1, 0
     metadata = None
     status_data, status_sha256 = None, None
+    history_required = False
     archive_saved = False
 
     def check_cancel():
@@ -530,6 +534,7 @@ def upload_file(file_path: str | Path, student_account: str, receiver_ip: str, *
                 raise TransferError("缺少监控日志模块，请将 monitoring.py 放到 upload.py 同一目录。") from exc
             try:
                 status_data = read_status_file(status_file, student_account)
+                history_required = json.loads(status_data).get("schema") != "lan-programming-status/1"
                 status_sha256 = hashlib.sha256(status_data).hexdigest()
             except (MonitorError, OSError) as exc:
                 raise TransferError(f"无法读取监控日志：{exc}") from exc
@@ -548,6 +553,8 @@ def upload_file(file_path: str | Path, student_account: str, receiver_ip: str, *
                         raise TransferError("该地址不是兼容的教师接收端，请核对 IP 和程序版本。")
                     if status_data is not None and STATUS_FEATURE not in health.get("features", []):
                         raise TransferError("教师接收端尚不支持监控日志，请先更新教师端 upload.py 和 monitoring.py。")
+                    if history_required and HISTORY_FEATURE not in health.get("features", []):
+                        raise TransferError("教师端尚不支持监控历史与登录信息，请一起更新 upload.py 和 monitoring.py。")
                     if metadata is None:
                         emit("hashing", 0, 0, f"正在计算 {kind} 文件的 SHA256（尚未上传）")
                         stream.seek(0)
@@ -881,6 +888,8 @@ class _Handler(BaseHTTPRequestHandler):
                 try:
                     import monitoring
                     features = [STATUS_FEATURE]
+                    if hasattr(monitoring, "HISTORY_SCHEMA"):
+                        features.append(HISTORY_FEATURE)
                 except ImportError:
                     features = []
                 self.reply(200, {"ok": True, "protocol": PROTOCOL, "port": self.server.server_port, "features": features})
@@ -1011,11 +1020,11 @@ class _Handler(BaseHTTPRequestHandler):
             if self.headers.get_all("Content-Type", []) != ["application/json; charset=utf-8"]:
                 raise TransferError("监控日志必须为 UTF-8 JSON。")
             lengths = self.headers.get_all("Content-Length", [])
-            if len(lengths) != 1 or not re.fullmatch(r"[1-9][0-9]{0,6}", lengths[0]):
+            if len(lengths) != 1 or not re.fullmatch(r"[1-9][0-9]{0,7}", lengths[0]):
                 raise TransferError("监控日志长度无效。")
             length = int(lengths[0])
             if length > MAX_STATUS_BYTES:
-                raise TransferError("监控日志不能超过 512 KB。", 413)
+                raise TransferError(f"监控历史不能超过 {format_size(MAX_STATUS_BYTES)}。", 413)
             hashes = self.headers.get_all(STATUS_HASH_HEADER, [])
             if len(hashes) != 1 or not re.fullmatch(r"[0-9a-f]{64}", hashes[0]):
                 raise TransferError("监控日志 SHA256 无效。")

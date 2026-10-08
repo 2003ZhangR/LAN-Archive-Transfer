@@ -3,7 +3,8 @@
 python monitoring.py --student-account 20260001
 python monitoring.py --student-account 20260001 --agree
 按 Ctrl+C 停止。默认统计全部前台软件；--apps 可限制统计范围，浏览器仍告警。
-日志仅包含进程名、时长、输入事件次数、浏览器告警和 USB 盘符。
+日志包含登录时间、电脑信息、学生 IP、进程统计、浏览器告警和 USB 盘符。
+同一学号的历次监控按 sessions 顺序累积保存，运行中只更新当前会话。
 不保存具体按键、窗口标题、网址、搜索词、网页正文或 U 盘文件。
 """
 
@@ -14,11 +15,14 @@ import ctypes
 from ctypes import wintypes
 from datetime import datetime, timezone
 import json
+import ipaddress
 import math
 import os
 from pathlib import Path
+import platform
 import queue
 import re
+import socket
 import struct
 import sys
 import threading
@@ -26,8 +30,11 @@ import time
 import uuid
 
 
-SCHEMA = "lan-programming-status/1"
-MAX_STATUS_BYTES = 512 * 1024
+LEGACY_SCHEMA = "lan-programming-status/1"
+SCHEMA = "lan-programming-status/2"
+HISTORY_SCHEMA = "lan-programming-status-history/1"
+MAX_SESSION_BYTES = 512 * 1024
+MAX_STATUS_BYTES = 16 * 1024 * 1024
 MAX_APPS = 512
 MAX_EVENTS = 200
 BROWSERS = frozenset({"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
@@ -35,7 +42,8 @@ BROWSERS = frozenset({"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "o
                       "360se.exe", "sogouexplorer.exe"})
 NOTICE = ("课堂监控将重点检测并告警：前台浏览器使用，以及 USB 存储设备连接。"
           "同时统计前台软件名称、使用时长和按键/鼠标事件次数；"
-          "监控结果会随作业提交给教师。")
+          "每次监控还会记录登录时间、电脑名称、系统版本和学生电脑 IP，"
+          "按学号保留历次监控日志，并随作业提交给教师。")
 
 
 class MonitorError(ValueError):
@@ -44,6 +52,29 @@ class MonitorError(ValueError):
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def collect_device_info(receiver_ip: str | None = None) -> tuple[dict, str | None]:
+    """优先取得通往教师电脑的本机 IPv4；UDP connect 仅查询路由，不发送数据。"""
+    device = dict(hostname=socket.gethostname(), system=platform.system(),
+                  system_version=platform.version(), architecture=platform.machine())
+    if receiver_ip:
+        try:
+            target = str(ipaddress.IPv4Address(receiver_ip))
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+                connection.connect((target, 9000))
+                return device, connection.getsockname()[0]
+        except (OSError, ValueError):
+            pass
+    try:
+        addresses = {entry[4][0] for entry in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+        addresses = {value for value in addresses if not ipaddress.IPv4Address(value).is_loopback
+                     and not ipaddress.IPv4Address(value).is_link_local and value != "0.0.0.0"}
+        ordered = sorted(addresses, key=lambda value: (not ipaddress.IPv4Address(value).is_private,
+                                                       int(ipaddress.IPv4Address(value))))
+        return device, ordered[0] if ordered else None
+    except OSError:
+        return device, None
 
 
 def check_account(account: str):
@@ -119,18 +150,39 @@ def _date(value):
 def validate_status_bytes(data: bytes, account: str) -> dict:
     check_account(account)
     if not 0 < len(data) <= MAX_STATUS_BYTES:
-        raise MonitorError("监控日志为空或超过 512 KB。")
+        raise MonitorError("监控日志为空或超过 16 MB；已有历史不会被自动删除。")
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeError, ValueError, RecursionError) as exc:
         raise MonitorError("监控日志不是有效的 UTF-8 JSON。") from exc
+    if isinstance(value, dict) and value.get("schema") == HISTORY_SCHEMA:
+        if set(value) != {"schema", "student_account", "sessions"} or value["student_account"] != account:
+            raise MonitorError("监控历史字段或学号不匹配。")
+        sessions = value["sessions"]
+        if not isinstance(sessions, list) or not sessions:
+            raise MonitorError("监控历史必须包含会话记录。")
+        seen = set()
+        for session in sessions:
+            _validate_session(session, account)
+            if session["session_id"] in seen:
+                raise MonitorError("监控历史中存在重复的会话编号。")
+            seen.add(session["session_id"])
+        return value
+    return _validate_session(value, account)
+
+
+def _validate_session(value: dict, account: str) -> dict:
     fields = {"schema", "student_account", "session_id", "started_at", "updated_at", "state",
               "consent", "scope", "sample_interval_seconds", "idle_threshold_seconds", "duration_seconds",
               "applications", "browser_events", "usb_events", "dropped_browser_events", "dropped_usb_events",
               "dropped_input_events", "sampling_gaps", "current_process", "error"}
-    if not isinstance(value, dict) or set(value) != fields:
+    if not isinstance(value, dict):
+        raise MonitorError("监控会话必须为 JSON 对象。")
+    if value.get("schema") == SCHEMA:
+        fields.update({"login_at", "device", "ip"})
+    if set(value) != fields:
         raise MonitorError("监控日志字段无效。")
-    if (value["schema"] != SCHEMA or value["student_account"] != account or value["consent"] is not True
+    if (value["schema"] not in (LEGACY_SCHEMA, SCHEMA) or value["student_account"] != account or value["consent"] is not True
             or value["scope"] != "foreground_counts_browser_usb_warn_only"):
         raise MonitorError("监控日志版本、学号或知情启用标记不匹配。")
     if not isinstance(value["session_id"], str) or not re.fullmatch(r"[0-9a-f]{32}", value["session_id"]):
@@ -139,6 +191,23 @@ def validate_status_bytes(data: bytes, account: str) -> dict:
         raise MonitorError("监控状态无效。")
     for name in ("started_at", "updated_at"):
         _date(value[name])
+    if value["schema"] == SCHEMA:
+        _date(value["login_at"])
+        device = value["device"]
+        if not isinstance(device, dict) or set(device) != {"hostname", "system", "system_version", "architecture"}:
+            raise MonitorError("登录设备信息字段无效。")
+        for item in device.values():
+            if not isinstance(item, str) or len(item) > 256 or any(ord(char) < 32 for char in item):
+                raise MonitorError("登录设备信息无效。")
+        if value["ip"] is not None:
+            try:
+                if not isinstance(value["ip"], str):
+                    raise ValueError()
+                address = ipaddress.IPv4Address(value["ip"])
+                if address.is_unspecified or address.is_multicast or address.is_reserved:
+                    raise ValueError()
+            except ValueError as exc:
+                raise MonitorError("登录设备 IP 无效。") from exc
     for name in ("sample_interval_seconds", "idle_threshold_seconds", "duration_seconds"):
         _number(value[name], name)
     for name in ("dropped_browser_events", "dropped_usb_events", "dropped_input_events", "sampling_gaps"):
@@ -192,7 +261,8 @@ def read_status_file(path: str | Path, account: str) -> bytes:
 class UsageSession:
     """可独立测试的统计器；所有数值汇总，不保存具体输入事件内容。"""
 
-    def __init__(self, account, interval=0.5, idle_threshold=60, apps=None, browsers=None, warning=None):
+    def __init__(self, account, interval=0.5, idle_threshold=60, apps=None, browsers=None, warning=None,
+                 *, login_at=None, device=None, ip=None):
         check_account(account)
         self.account, self.interval, self.idle_threshold = account, interval, idle_threshold
         self.allowed = {name.lower() for name in apps} if apps else None
@@ -200,6 +270,9 @@ class UsageSession:
         self.warning = warning or (lambda message: None)
         self.lock = threading.RLock()
         self.session_id, self.started_at = uuid.uuid4().hex, utc_now()
+        self.login_at = login_at or self.started_at
+        self.device = device if device is not None else collect_device_info()[0]
+        self.ip = ip
         self.started = self.last_sample = time.monotonic()
         self.current = None
         self.state, self.error = "running", ""
@@ -270,6 +343,7 @@ class UsageSession:
                     app[key] = round(app[key], 3)
                 apps.append(app)
             return dict(schema=SCHEMA, student_account=self.account, session_id=self.session_id,
+                        login_at=self.login_at, device=dict(self.device), ip=self.ip,
                         started_at=self.started_at, updated_at=utc_now(), state=self.state, consent=True,
                         scope="foreground_counts_browser_usb_warn_only", sample_interval_seconds=self.interval,
                         idle_threshold_seconds=self.idle_threshold, duration_seconds=round(time.monotonic() - self.started, 3),
@@ -281,6 +355,8 @@ class UsageSession:
 
     def encode(self, dropped_input_events=0):
         data = json.dumps(self.snapshot(dropped_input_events), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(data) > MAX_SESSION_BYTES:
+            raise MonitorError("单次监控日志不能超过 512 KB。")
         validate_status_bytes(data, self.account)
         return data
 
@@ -425,6 +501,11 @@ class WindowsBackend:
             self.kernel.CloseHandle(self.mutex)
             self.mutex = None
             raise MonitorError("该学号的监控已在运行，请使用已有监控窗口。")
+        self.ready.clear()
+        self.error = None
+        self.thread_id = 0
+        self.events = queue.Queue(maxsize=10000)
+        self.dropped_events = 0
         self.thread = threading.Thread(target=self._hook_loop, name="input-count-hooks", daemon=True)
         self.thread.start()
         if not self.ready.wait(5) or self.error:
@@ -506,13 +587,17 @@ class VisibleWarning:
 
 class ActivityMonitor:
     def __init__(self, account, *, log_dir=None, apps=None, browsers=None, interval=0.5,
-                 idle_threshold=60, warning=None, backend=None):
+                 idle_threshold=60, warning=None, backend=None, login_at=None, receiver_ip=None):
         if not 0.2 <= interval <= 5 or not 1 <= idle_threshold <= 3600:
             raise MonitorError("采样间隔须为 0.2–5 秒，空闲阈值须为 1–3600 秒。")
         for name in list(apps or []) + list(browsers or []):
             check_process(name)
         self.path = default_status_path(account, log_dir)
         self.session = UsageSession(account, interval, idle_threshold, apps, browsers, warning or VisibleWarning())
+        if login_at is not None:
+            _date(login_at)
+        self.login_at, self.receiver_ip = login_at, receiver_ip
+        self.history = None
         self.backend = backend or WindowsBackend(account)
         self.stop_event = threading.Event()
         self.thread = None
@@ -523,7 +608,23 @@ class ActivityMonitor:
     def save(self):
         # GUI 提交快照与定期保存可能同时发生，序列化快照和落盘，避免旧快照晚写覆盖。
         with self.save_lock:
-            atomic_hidden_write(self.path, self.session.encode(self.backend.dropped_events))
+            if self.history is None:
+                raise MonitorError("请先启动监控，再保存日志。")
+            current = json.loads(self.session.encode(self.backend.dropped_events))
+            data = json.dumps(dict(schema=HISTORY_SCHEMA, student_account=self.session.account,
+                                   sessions=[*self.history, current]),
+                              ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            validate_status_bytes(data, self.session.account)
+            atomic_hidden_write(self.path, data)
+
+    def _load_history(self):
+        if not self.path.exists():
+            return []
+        # 损坏或学号不匹配时拒绝覆盖，保留原文件供排查。
+        previous = json.loads(read_status_file(self.path, self.session.account))
+        sessions = previous["sessions"] if previous["schema"] == HISTORY_SCHEMA else [previous]
+        # 同一个 ActivityMonitor 对象再次启动时，也保留上次会话并使用新编号。
+        return sessions
 
     def _sample(self):
         for name, kind in self.backend.operations():
@@ -537,6 +638,14 @@ class ActivityMonitor:
             raise MonitorError("监控已经启用。")
         try:
             self.backend.start()
+            self.history = self._load_history()
+            device, ip = collect_device_info(self.receiver_ip)
+            previous = self.session
+            self.session = UsageSession(previous.account, previous.interval, previous.idle_threshold,
+                                        previous.allowed, previous.browsers, previous.warning,
+                                        login_at=self.login_at, device=device, ip=ip)
+            self.stop_event.clear()
+            self.error = None
             self._sample()
             self.save()
             self.thread = threading.Thread(target=self._run, name="software-usage-monitor", daemon=True)
@@ -579,6 +688,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--student-account", required=True, help="学生学号")
     parser.add_argument("--log-dir", help="日志目录，默认项目下的 student_status")
+    parser.add_argument("--ip", help="教师电脑 IPv4，用于确定学生电脑连接教师端的本机 IP")
     parser.add_argument("--apps", nargs="+", help="统计的软件进程名，例如 code.exe pycharm64.exe；默认全部前台软件")
     parser.add_argument("--browser", action="append", help="补充需要告警的浏览器进程名")
     parser.add_argument("--agree", action="store_true", help="学生已知悉并同意上述统计范围")
@@ -589,7 +699,8 @@ def main():
         return 0
     monitor = None
     try:
-        monitor = ActivityMonitor(args.student_account, log_dir=args.log_dir, apps=args.apps, browsers=args.browser)
+        monitor = ActivityMonitor(args.student_account, log_dir=args.log_dir, apps=args.apps,
+                                  browsers=args.browser, receiver_ip=args.ip)
         monitor.start(consent=True)
         print(f"监控已启用。学号：{args.student_account}\n重点告警：前台浏览器使用、USB 存储设备连接。\n按 Ctrl+C 停止监控。", flush=True)
         while not monitor.stop_event.wait(5):
