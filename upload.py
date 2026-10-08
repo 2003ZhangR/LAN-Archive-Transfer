@@ -45,6 +45,7 @@ import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterable
@@ -147,6 +148,7 @@ PROTOCOL = "lan-archive/3"
 
 STATUS_FEATURE = "programming-status-v1"
 HISTORY_FEATURE = "programming-status-history-v1"
+ACTIVITY_LOG_SCHEMA = "lan-programming-status-receipts/1"
 
 
 STATUS_HASH_HEADER = "X-Programming-Status-SHA256"
@@ -473,7 +475,9 @@ def _send_status(ip, port, metadata, data, status_sha256):
         if (result.get("upload_id") != metadata.upload_id
                 or result.get("student_account") != metadata.student_account
                 or result.get("status_sha256") != status_sha256
-                or result.get("status_filename") != f".programming-status-{metadata.upload_id}.json"):
+                or result.get("status_filename") not in (
+                    f".programming-status-{metadata.student_account}.json",
+                    f".programming-status-{metadata.upload_id}.json")):
             raise TransferError("监控日志接收确认的学号、提交编号或 SHA256 不匹配。")
         return result
     finally:
@@ -690,9 +694,107 @@ class ReceiverServer(ThreadingHTTPServer):
         self.connections = set()
         self.connections_lock = threading.Lock()
         self.registry_lock = threading.Lock()
+        self.activity_locks = {}
         self.active_uploads = {}
         self.completed_uploads = OrderedDict()
         super().__init__((host, port), _Handler)
+
+    def save_activity(self, submission: Submission, activity: dict, status_sha256: str) -> Path:
+        """一个学号一个日志；合并、原子保存成功后再清理旧的按提交编号命名的文件。"""
+        from monitoring import (
+            MAX_STORED_STATUS_BYTES, MonitorError, merge_status_histories, set_hidden,
+            utc_now, validate_status_bytes,
+        )
+        with self.registry_lock:
+            lock = self.activity_locks.setdefault(submission.student_account, threading.Lock())
+        storage = self.storage
+        directory = storage.checked_path(storage.root / submission.student_account)
+        filename = f".programming-status-{submission.student_account}.json"
+        target = storage.checked_path(directory / filename)
+        with lock:
+            histories, receipts, legacy_files = [], {}, []
+            sources = [target] if target.exists() else []
+            for path in sorted(directory.glob(".programming-status-*.json")):
+                if path != target and re.fullmatch(r"\.programming-status-[0-9a-f]{32}\.json", path.name):
+                    sources.append(storage.checked_path(path))
+            try:
+                for path in sources:
+                    with path.open("rb") as stream:
+                        raw = stream.read(MAX_STORED_STATUS_BYTES + 1)
+                    if not raw or len(raw) > MAX_STORED_STATUS_BYTES:
+                        raise MonitorError("教师端已有监控日志为空或超过 64 MB。")
+                    document = json.loads(raw)
+                    if not isinstance(document, dict):
+                        raise MonitorError("教师端已有监控日志格式无效。")
+                    if document.get("schema") == ACTIVITY_LOG_SCHEMA:
+                        if (set(document) != {"schema", "student_account", "activity", "submissions"}
+                                or document["student_account"] != submission.student_account
+                                or not isinstance(document["submissions"], list) or not document["submissions"]):
+                            raise MonitorError("教师端已有监控汇总字段无效。")
+                        records = document["submissions"]
+                    else:
+                        if set(document) != {"submission", "received_at", "status_sha256", "activity"}:
+                            raise MonitorError("教师端已有监控日志字段无效。")
+                        records = [{key: document[key] for key in ("submission", "received_at", "status_sha256")}]
+                    encoded_activity = json.dumps(document["activity"], ensure_ascii=False).encode("utf-8")
+                    histories.append(validate_status_bytes(encoded_activity, submission.student_account,
+                                                           max_bytes=MAX_STORED_STATUS_BYTES))
+                    for record in records:
+                        if not isinstance(record, dict) or set(record) != {"submission", "received_at", "status_sha256"}:
+                            raise MonitorError("教师端已有提交记录字段无效。")
+                        metadata = Submission(**record["submission"])
+                        metadata.validate()
+                        if metadata.student_account != submission.student_account:
+                            raise MonitorError("教师端已有日志学号不匹配。")
+                        if (not isinstance(record["status_sha256"], str)
+                                or not re.fullmatch(r"[0-9a-f]{64}", record["status_sha256"])
+                                or not isinstance(record["received_at"], str)
+                                or datetime.fromisoformat(record["received_at"]).tzinfo is None):
+                            raise MonitorError("教师端已有提交确认信息无效。")
+                        previous = receipts.get(metadata.upload_id)
+                        if previous and previous["submission"] != record["submission"]:
+                            raise MonitorError("教师端已有提交编号的文件信息不一致。")
+                        if previous is None or datetime.fromisoformat(record["received_at"]) > datetime.fromisoformat(previous["received_at"]):
+                            receipts[metadata.upload_id] = record
+                    if path != target:
+                        legacy_files.append((path, hashlib.sha256(raw).hexdigest()))
+                histories.append(activity)
+                combined = merge_status_histories(histories, submission.student_account)
+                validate_status_bytes(json.dumps(combined, ensure_ascii=False).encode("utf-8"),
+                                      submission.student_account, max_bytes=MAX_STORED_STATUS_BYTES)
+            except (MonitorError, TransferError, ValueError, TypeError, KeyError, RecursionError) as exc:
+                raise TransferError(f"监控历史合并失败，已有日志已保留：{exc}") from exc
+            receipt = {"submission": asdict(submission), "received_at": utc_now(), "status_sha256": status_sha256}
+            previous = receipts.get(submission.upload_id)
+            if previous and previous["submission"] != receipt["submission"]:
+                raise TransferError("已有日志中的提交编号与本次文件信息不一致。")
+            receipts[submission.upload_id] = receipt
+            envelope = dict(schema=ACTIVITY_LOG_SCHEMA, student_account=submission.student_account,
+                            activity=combined, submissions=sorted(receipts.values(), key=lambda record: datetime.fromisoformat(record["received_at"])))
+            encoded = json.dumps(envelope, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+            if len(encoded) > MAX_STORED_STATUS_BYTES:
+                raise TransferError("教师端汇总日志超过 64 MB，已有日志已保留。", 413)
+            temporary = storage.checked_path(directory / f".{uuid.uuid4().hex}.uploading")
+            try:
+                with temporary.open("xb") as stream:
+                    stream.write(encoded)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                set_hidden(temporary)
+                target = storage.commit(temporary, filename)
+            finally:
+                temporary.unlink(missing_ok=True)
+            for path, digest in legacy_files:
+                try:
+                    storage.checked_path(path)
+                    # 如果外部程序在合并过程中更新旧文件，保留它供下次再合并。
+                    with path.open("rb") as stream:
+                        current = stream.read(MAX_STORED_STATUS_BYTES + 1)
+                    if hmac.compare_digest(hashlib.sha256(current).hexdigest(), digest):
+                        path.unlink()
+                except (OSError, TransferError):
+                    logger.warning("汇总已保存，旧日志暂未清理：%s", path.name)
+            return target
 
     def submission_status(self, submission: Submission) -> dict:
         with self.registry_lock:
@@ -1005,9 +1107,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def receive_activity(self):
         """内部辅助日志接口：只能绑定已完成、信息完全匹配的 ZIP/RAR 提交。"""
-        temporary, saved = None, False
+        saved = False
         try:
-            from monitoring import MAX_STATUS_BYTES, MonitorError, validate_status_bytes, set_hidden, utc_now
+            from monitoring import MAX_STATUS_BYTES, MonitorError, validate_status_bytes
             if self.server.stopping.is_set():
                 raise TransferError("教师已停止接收。", 503, True)
             values = self.headers.get_all(METADATA_HEADER, [])
@@ -1040,22 +1142,8 @@ class _Handler(BaseHTTPRequestHandler):
                 activity = validate_status_bytes(data, submission.student_account)
             except MonitorError as exc:
                 raise TransferError(str(exc)) from exc
-            filename = f".programming-status-{submission.upload_id}.json"
-            storage = self.server.storage
-            directory = storage.checked_path(storage.root / submission.student_account)
-            target = storage.checked_path(directory / filename)
-            temporary = storage.checked_path(directory / f".{uuid.uuid4().hex}.uploading")
-            # 教师生成作业绑定信息，学生不能指定日志保存路径或伪造教师端文件名。
-            envelope = {"submission": asdict(submission), "received_at": utc_now(),
-                        "status_sha256": status_sha256, "activity": activity}
-            encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            with temporary.open("xb") as stream:
-                stream.write(encoded)
-                stream.flush()
-                os.fsync(stream.fileno())
-            set_hidden(temporary)
-            storage.commit(temporary, filename)
-            temporary, saved = None, True
+            target = self.server.save_activity(submission, activity, status_sha256)
+            saved = True
             self.server.notify(Progress("status", submission.size, submission.size, 0,
                                         "监控日志已保存", task_id=submission.upload_id,
                                         student_account=submission.student_account, filename=submission.filename,
@@ -1076,13 +1164,6 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             logger.exception("接收监控日志失败")
             self.reply_safely(500, "教师端接收监控日志失败，请联系教师。")
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    logger.exception("监控日志临时文件清理失败，文件仍以 .uploading 命名")
-
     def reply_safely(self, status, message, retryable=False):
         try:
             self.reply(status, {"ok": False, "message": message, "retryable": retryable})

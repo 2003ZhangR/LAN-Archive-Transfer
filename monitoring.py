@@ -35,6 +35,7 @@ SCHEMA = "lan-programming-status/2"
 HISTORY_SCHEMA = "lan-programming-status-history/1"
 MAX_SESSION_BYTES = 512 * 1024
 MAX_STATUS_BYTES = 16 * 1024 * 1024
+MAX_STORED_STATUS_BYTES = 64 * 1024 * 1024
 MAX_APPS = 512
 MAX_EVENTS = 200
 BROWSERS = frozenset({"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
@@ -147,10 +148,10 @@ def _date(value):
         raise MonitorError("日志时间必须包含时区。") from exc
 
 
-def validate_status_bytes(data: bytes, account: str) -> dict:
+def validate_status_bytes(data: bytes, account: str, *, max_bytes: int = MAX_STATUS_BYTES) -> dict:
     check_account(account)
-    if not 0 < len(data) <= MAX_STATUS_BYTES:
-        raise MonitorError("监控日志为空或超过 16 MB；已有历史不会被自动删除。")
+    if not 0 < len(data) <= max_bytes:
+        raise MonitorError(f"监控日志为空或超过 {max_bytes // (1024 * 1024)} MB；已有历史不会被自动删除。")
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeError, ValueError, RecursionError) as exc:
@@ -169,6 +170,30 @@ def validate_status_bytes(data: bytes, account: str) -> dict:
             seen.add(session["session_id"])
         return value
     return _validate_session(value, account)
+
+
+def merge_status_histories(histories: list[dict], account: str) -> dict:
+    """按会话编号合并，较早上传的快照不会覆盖更完整的会话。调用前应校验输入。"""
+    merged = {}
+    for history in histories:
+        sessions = history["sessions"] if history["schema"] == HISTORY_SCHEMA else [history]
+        for session in sessions:
+            previous = merged.get(session["session_id"])
+            if previous is not None:
+                fixed = ("schema", "student_account", "started_at", "consent", "scope",
+                         "sample_interval_seconds", "idle_threshold_seconds", "login_at", "device", "ip")
+                if any(previous.get(key) != session.get(key) for key in fixed):
+                    raise MonitorError("同一监控会话的登录信息或采集配置不一致，不能合并。")
+
+                def freshness(entry):
+                    return (entry["duration_seconds"], datetime.fromisoformat(entry["updated_at"]),
+                            entry["state"] != "running")
+
+                if freshness(session) <= freshness(previous):
+                    continue
+            merged[session["session_id"]] = session
+    sessions = sorted(merged.values(), key=lambda entry: datetime.fromisoformat(entry["started_at"]))
+    return dict(schema=HISTORY_SCHEMA, student_account=account, sessions=sessions)
 
 
 def _validate_session(value: dict, account: str) -> dict:
@@ -613,7 +638,7 @@ class ActivityMonitor:
             current = json.loads(self.session.encode(self.backend.dropped_events))
             data = json.dumps(dict(schema=HISTORY_SCHEMA, student_account=self.session.account,
                                    sessions=[*self.history, current]),
-                              ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                              ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
             validate_status_bytes(data, self.session.account)
             atomic_hidden_write(self.path, data)
 
