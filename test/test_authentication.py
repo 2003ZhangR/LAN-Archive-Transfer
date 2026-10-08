@@ -123,7 +123,8 @@ class AuthenticationHTTPTests(unittest.TestCase):
     def test_data_endpoints_require_login(self):
         headers = {METADATA_HEADER: self.submission.encode(), "Content-Type": "application/octet-stream"}
         for method, path in (("GET", "/status"), ("POST", "/upload"), ("POST", "/activity")):
-            status, _ = self.request(method, path, headers, self.archive.read_bytes())
+            body = self.archive.read_bytes() if method == "POST" else b""
+            status, _ = self.request(method, path, headers, body)
             self.assertEqual(status, 401)
         self.assertEqual(list(self.server.storage.root.iterdir()), [])
 

@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import argparse
-import getpass
+import csv
 import hashlib
 import hmac
 import re
@@ -17,7 +17,8 @@ import time
 DEFAULT_DB = Path(__file__).resolve().parent / "teacher_data" / "students.sqlite3"
 AUTH_FEATURE = "student-auth-v1"
 SESSION_SECONDS = 8 * 60 * 60
-RESET_PASSWORD = "12345678"
+DEFAULT_PASSWORD = "12345678"
+RESET_PASSWORD = DEFAULT_PASSWORD
 
 
 class AccountError(ValueError):
@@ -66,7 +67,7 @@ class AccountDatabase:
         finally:
             connection.close()
 
-    def add_student(self, account: str, password: str, name: str = ""):
+    def add_student(self, account: str, password: str = DEFAULT_PASSWORD, name: str = ""):
         validate_account(account)
         validate_password(password)
         salt = secrets.token_bytes(16)
@@ -78,6 +79,45 @@ class AccountDatabase:
                     (account, name, salt, password_hash(password, salt), datetime.now(timezone.utc).isoformat()))
         except sqlite3.IntegrityError as exc:
             raise AccountError("该学号已存在。修改已有密码请使用重置命令。") from exc
+
+    def import_csv(self, path: str | Path) -> dict:
+        """CSV 只新增账号，已有学号和文件内重复学号跳过，不覆盖学生密码。"""
+        students = []
+        with Path(path).open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            headers = reader.fieldnames or []
+            account_column = next((key for key in ("学号", "student_account") if key in headers), None)
+            name_column = next((key for key in ("姓名", "name") if key in headers), None)
+            if account_column is None:
+                raise AccountError("CSV 需要“学号”或 student_account 列；姓名列可选，请使用 UTF-8 编码。")
+            for number, row in enumerate(reader, 2):
+                account = (row.get(account_column) or "").strip()
+                name = (row.get(name_column) or "").strip() if name_column else ""
+                if not account and not name:
+                    continue
+                try:
+                    validate_account(account)
+                except AccountError as exc:
+                    raise AccountError(f"CSV 第 {number} 行：{exc}") from exc
+                students.append((account, name))
+        if not students:
+            raise AccountError("CSV 中没有学生账号。")
+        existing = {row["student_account"] for row in self.list_students()}
+        prepared = []
+        for account, name in students:
+            if account in existing:
+                continue
+            existing.add(account)
+            salt = secrets.token_bytes(16)
+            prepared.append((account, name, salt, password_hash(DEFAULT_PASSWORD, salt),
+                             datetime.now(timezone.utc).isoformat()))
+        with self.connect() as connection:
+            before = connection.total_changes
+            connection.executemany("""INSERT OR IGNORE INTO students
+                (student_account, name, password_salt, password_hash, created_at)
+                VALUES (?, ?, ?, ?, ?)""", prepared)
+            imported = connection.total_changes - before
+        return {"imported": imported, "skipped": len(students) - imported}
 
     def list_students(self) -> list[dict]:
         with self.connect() as connection:
@@ -153,20 +193,14 @@ class Authenticator:
             self.sessions.pop(token, None)
 
 
-def input_new_password() -> str:
-    password = getpass.getpass("输入新密码：")
-    if password != getpass.getpass("再次输入新密码："):
-        raise AccountError("两次密码不一致，未保存。")
-    validate_password(password)
-    return password
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="教师本地管理学生账号")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="账号 SQLite 数据库路径")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="创建空账号库")
     commands.add_parser("list", help="列出学生账号")
+    load = commands.add_parser("import", help="从 CSV 批量创建学生账号，默认密码 12345678")
+    load.add_argument("--file", required=True)
     for verb, help_text in (("add", "创建学生账号"), ("reset", "忘记密码时由教师重置")):
         command = commands.add_parser(verb, help=help_text)
         command.add_argument("--student-account", required=True)
@@ -180,18 +214,20 @@ def main() -> int:
         elif args.command == "list":
             for row in database.list_students():
                 print(f"{row['student_account']}\t{row['name']}")
+        elif args.command == "import":
+            result = database.import_csv(args.file)
+            print(f"导入 {result['imported']} 个账号，跳过 {result['skipped']} 个重复账号；初始密码为 {DEFAULT_PASSWORD}。")
         else:
             validate_account(args.student_account)
             if args.command == "reset" and database.get_student(args.student_account) is None:
                 raise AccountError("该学号不存在。")
             if args.command == "add":
-                password = input_new_password()
-                database.add_student(args.student_account, password, args.name)
-                print(f"已创建账号：{args.student_account}")
+                database.add_student(args.student_account, name=args.name)
+                print(f"已创建账号：{args.student_account}，初始密码为 {DEFAULT_PASSWORD}。")
             else:
                 database.reset_password(args.student_account)
                 print(f"已重置账号 {args.student_account} 的密码为 {RESET_PASSWORD}。")
-    except (AccountError, OSError, sqlite3.Error) as exc:
+    except (AccountError, OSError, sqlite3.Error, UnicodeError, csv.Error) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):

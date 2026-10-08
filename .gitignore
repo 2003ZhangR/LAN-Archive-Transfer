@@ -6,5 +6,7 @@ test/artifacts/
 requirements.txt
 test/*
 !test/test_authentication.py
+!test/test_teacher_client.py
 接收作业/
 teacher_data/
+版本迭代开发日志.md
