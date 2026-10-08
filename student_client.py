@@ -1,6 +1,6 @@
 """学生端：填写信息 → 确认监控 → 选择压缩文件并上传。
 
-密码校验预留在 enter_student_session，目前仅检查输入和教师端连接。
+教师端验证账号密码后才能进入；上传和监控日志使用短期登录令牌。
 运行：python student_client.py [--ip 192.168.1.20]
 """
 
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import threading
@@ -18,7 +18,7 @@ try:
     from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
     from PySide6.QtGui import QCloseEvent, QFont
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+        QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
         QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar,
         QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
     )
@@ -27,7 +27,7 @@ except ImportError:
 
 from monitoring import ActivityMonitor, NOTICE, utc_now
 from upload import (
-    Progress, TransferError, UploadCancelled, check_receiver, format_size,
+    PORT, Progress, TransferError, UploadCancelled, change_student_password, format_size, login_student, logout_student,
     upload_file, validate_ip, validate_open_file, validate_student_account,
 )
 
@@ -41,16 +41,18 @@ class StudentSession:
     account: str
     receiver_ip: str
     login_at: str = field(default_factory=utc_now)
+    token: str = field(default="", repr=False)
+    expires_at: str = ""
 
 
-def enter_student_session(receiver_ip: str, account: str, password: str) -> StudentSession:
-    """未来在这里调用教师端认证接口。当前密码仅检查非空，不保存、不发送。"""
+def enter_student_session(receiver_ip: str, account: str, password: str, *, port: int = PORT) -> StudentSession:
+    """只在教师端验证成功后建立学生会话，不保存明文密码。"""
     ip = validate_ip(receiver_ip)
     account = validate_student_account(account)
     if not password or not password.strip():
-        raise TransferError("请填写密码。密码验证功能后续接入。")
-    check_receiver(ip, require_status=True)
-    return StudentSession(account, ip)
+        raise TransferError("请填写密码。")
+    result = login_student(ip, account, password, port=port, require_status=True)
+    return StudentSession(account, ip, token=result["token"], expires_at=result["expires_at"])
 
 
 class TaskThread(QThread):
@@ -127,13 +129,16 @@ def card() -> tuple[QFrame, QVBoxLayout]:
 
 class StudentWindow(QMainWindow):
     def __init__(self, receiver_ip: str = "", *, monitor_factory=ActivityMonitor,
-                 uploader=upload_file, session_opener=enter_student_session):
+                 uploader=upload_file, session_opener=enter_student_session, session_closer=logout_student,
+                 password_changer=change_student_password):
         super().__init__()
         self.setWindowTitle("课堂作业 · 学生端")
         self.resize(920, 820)
         self.setMinimumSize(600, 620)
         self.setStyleSheet(STYLE)
         self.monitor_factory, self.uploader, self.session_opener = monitor_factory, uploader, session_opener
+        self.session_closer = session_closer
+        self.password_changer = password_changer
         self.session: StudentSession | None = None
         self.monitor: ActivityMonitor | None = None
         self.selected_file: Path | None = None
@@ -186,7 +191,7 @@ class StudentWindow(QMainWindow):
         self.show_password.toggled.connect(self._toggle_password)
         password_row.addWidget(self.show_password)
         body.addLayout(password_row)
-        password_notice = label("密码验证待接入：当前填写信息即可进入，密码不会保存或发送。", "notice")
+        password_notice = label("账号由教师创建。学号和密码验证通过后才能进入；忘记密码请联系教师。", "notice")
         password_notice.setMinimumHeight(64)
         body.addWidget(password_notice)
         self.login_message = label("", "error")
@@ -210,6 +215,9 @@ class StudentWindow(QMainWindow):
         layout.setSpacing(16)
         header = QHBoxLayout()
         header.addWidget(label("课堂作业 · 学生端", "title"), 1)
+        self.change_password_button = QPushButton("修改密码")
+        self.change_password_button.clicked.connect(self._change_password)
+        header.addWidget(self.change_password_button)
         self.logout_button = QPushButton("退出登录")
         self.logout_button.clicked.connect(self._logout)
         header.addWidget(self.logout_button)
@@ -346,6 +354,11 @@ class StudentWindow(QMainWindow):
                 self.progress_bar.setRange(0, 1000)
                 self.upload_status.setText(error)
                 self._record(error)
+            elif name == "logout":
+                self._record(error)
+                self.session = None
+            elif name == "change_password":
+                QMessageBox.warning(self, "修改密码失败", error)
             else:
                 self.monitor_status.setText("● 监控操作失败")
                 self.monitor_details.setText(error)
@@ -359,6 +372,11 @@ class StudentWindow(QMainWindow):
             self.login_message.clear()
             self.pages.setCurrentIndex(1)
             self._record("已进入学生端，请确认监控范围。")
+        elif name == "logout":
+            self.session = None
+        elif name == "change_password":
+            self.login_message.setText("密码修改成功，请使用新密码登录。")
+            self._request_exit("login")
         elif name == "start_monitor":
             self.monitor = result
             self.monitor_fault_shown = False
@@ -399,6 +417,7 @@ class StudentWindow(QMainWindow):
         self.upload_button.setEnabled(running and self.selected_file is not None and not busy)
         self.cancel_button.setEnabled("upload" in self.jobs and not self.cancel_upload.is_set() and self.exit_destination is None)
         self.logout_button.setEnabled(self.session is not None and not busy)
+        self.change_password_button.setEnabled(self.session is not None and not busy)
 
     @Slot()
     def _start_monitor(self):
@@ -426,6 +445,11 @@ class StudentWindow(QMainWindow):
 
     @Slot()
     def _poll_monitor(self):
+        if (self.session and self.session.expires_at and not self.exit_destination
+                and datetime.fromisoformat(self.session.expires_at) <= datetime.now(timezone.utc)):
+            self.login_message.setText("登录已过期，请重新输入账号密码。")
+            self._request_exit("login")
+            return
         if self.monitor is None or "stop_monitor" in self.jobs:
             return
         if self.monitor.error is not None:
@@ -508,7 +532,7 @@ class StudentWindow(QMainWindow):
                 raise TransferError("监控已停止或异常，请重新启用后提交。")
             monitor.save()
             return uploader(path, session.account, session.receiver_ip, status_file=monitor.path,
-                            progress=progress, cancel=cancel)
+                            progress=progress, cancel=cancel, session_token=session.token)
 
         self.progress_bar.setValue(0)
         self.upload_status.setText("正在准备上传…")
@@ -534,6 +558,46 @@ class StudentWindow(QMainWindow):
             self._update_controls()
 
     @Slot()
+    def _change_password(self):
+        if not self.change_password_button.isEnabled():
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("修改密码")
+        form = QFormLayout(dialog)
+        fields = []
+        for title in ("旧密码", "新密码", "确认新密码"):
+            field = QLineEdit()
+            field.setEchoMode(QLineEdit.EchoMode.Password)
+            field.setMaxLength(128)
+            form.addRow(title, field)
+            fields.append(field)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.submit_password_change(*(field.text() for field in fields))
+        for field in fields:
+            field.clear()
+        dialog.deleteLater()
+
+    def submit_password_change(self, old_password: str, new_password: str, confirmation: str) -> bool:
+        if self.session is None or self.jobs or self.exit_destination:
+            return False
+        if not old_password.strip() or not new_password.strip():
+            QMessageBox.warning(self, "修改密码", "请填写旧密码和新密码。")
+            return False
+        if new_password != confirmation:
+            QMessageBox.warning(self, "修改密码", "两次新密码不一致。")
+            return False
+        session, changer = self.session, self.password_changer
+        self._launch("change_password", lambda progress:
+                     changer(session.receiver_ip, session.token, old_password, new_password))
+        return True
+
+    @Slot()
     def _logout(self):
         if self.jobs:
             return
@@ -554,6 +618,10 @@ class StudentWindow(QMainWindow):
             return
         if self.monitor is not None:
             self._stop_monitor()
+            return
+        if self.session is not None and self.session.token:
+            session, closer = self.session, self.session_closer
+            self._launch("logout", lambda progress: closer(session.receiver_ip, session.token))
             return
         destination = self.exit_destination
         self.exit_destination = None
@@ -578,7 +646,7 @@ class StudentWindow(QMainWindow):
         if self.exit_destination:
             event.ignore()
             return
-        if self.monitor is None and not self.jobs:
+        if self.monitor is None and not self.jobs and (self.session is None or not self.session.token):
             event.accept()
             return
         event.ignore()

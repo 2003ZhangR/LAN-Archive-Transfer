@@ -1,6 +1,6 @@
 """局域网 ZIP / RAR 作业上传：传输实现位于本文件，仅依赖 Python 3.12+ 标准库。
 
-上传接口：upload_file(file_path, student_account, receiver_ip, retries=2)
+上传接口：先 login_student 登录，再 upload_file(..., session_token=登录令牌)。
 学生账户就是学号，教师端按 保存目录 / 学号 / 文件名 归档。
 同一学号目录下的同名文件默认覆盖；新文件接收并校验成功后才原子替换旧文件。
 并发提交同名文件时，最后成功完成保存的文件生效。
@@ -10,7 +10,7 @@
 接收进程重启或确认记录被淘汰后，重试会按同名覆盖规则再次保存。
 本工具验证扩展名、ZIP/RAR4/RAR5 文件头及 SHA256，不压缩、不解压。
 monitoring.py 提供学生知情启用的统计与告警；send 自动附带该学号已有的隐藏日志。
-编程接口通过 status_file 指定日志，普通 ZIP/RAR 上传接口继续兼容。
+编程接口通过 status_file 指定日志，所有 ZIP/RAR 上传均须传入登录令牌。
 
 命令行：
   python upload.py receive --save-dir "D:/学生作业"
@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import stat
 import sys
 import threading
@@ -49,6 +50,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterable
+
+from accounts import AUTH_FEATURE, DEFAULT_DB, AccountDatabase, AccountError, Authenticator, validate_password
 
 
 class TransferError(Exception):
@@ -384,10 +387,16 @@ def _response_json(response: http.client.HTTPResponse) -> dict:
     return fields
 
 
-def _request_json(ip: str, port: int, path: str, headers: dict | None = None) -> dict:
-    connection = http.client.HTTPConnection(ip, port, timeout=8.0)
+def _request_json(ip: str, port: int, path: str, headers: dict | None = None, *,
+                  body: dict | None = None) -> dict:
+    connection = http.client.HTTPConnection(ip, port, timeout=8)
     try:
-        connection.request("GET", path, headers={"Connection": "close", **(headers or {})})
+        request_headers = {"Connection": "close", **(headers or {})}
+        data = None
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            request_headers["Content-Type"] = "application/json; charset=utf-8"
+        connection.request("POST" if body is not None else "GET", path, body=data, headers=request_headers)
         return _response_json(connection.getresponse())
     finally:
         connection.close()
@@ -411,6 +420,59 @@ def check_receiver(receiver_ip: str, *, port: int = PORT, require_status: bool =
     return health
 
 
+def auth_headers(token: str) -> dict:
+    if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        raise TransferError("请先使用账号密码登录，取得有效登录会话。", 401)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def login_student(receiver_ip: str, student_account: str, password: str, *,
+                  port: int = PORT, require_status: bool = False) -> dict:
+    ip = validate_ip(receiver_ip)
+    validate_student_account(student_account)
+    try:
+        validate_password(password)
+    except AccountError as exc:
+        raise TransferError(str(exc), exc.status) from exc
+    health = check_receiver(ip, port=port, require_status=require_status)
+    if AUTH_FEATURE not in health.get("features", []) or health.get("authentication_required") is not True:
+        raise TransferError("教师端尚未启用账号密码验证，请先更新教师端程序。")
+    try:
+        result = _request_json(ip, port, "/auth/login", body=dict(student_account=student_account, password=password))
+    except (OSError, http.client.HTTPException) as exc:
+        raise TransferError("登录时无法连接教师电脑，请检查网络后重试。", 503) from exc
+    auth_headers(result.get("token"))
+    if (result.get("student_account") != student_account or not isinstance(result.get("expires_at"), str)):
+        raise TransferError("教师端登录响应无效，请联系教师。")
+    try:
+        if datetime.fromisoformat(result["expires_at"]).tzinfo is None:
+            raise ValueError("missing timezone")
+    except ValueError as exc:
+        raise TransferError("教师端登录有效期无效，请联系教师。") from exc
+    return result
+
+
+def logout_student(receiver_ip: str, token: str, *, port: int = PORT):
+    ip = validate_ip(receiver_ip)
+    try:
+        _request_json(ip, port, "/auth/logout", auth_headers(token), body={})
+    except (OSError, http.client.HTTPException) as exc:
+        raise TransferError("无法通知教师端退出，登录令牌将在有效期结束后失效。", 503) from exc
+
+
+def change_student_password(receiver_ip: str, token: str, old_password: str, new_password: str,
+                            *, port: int = PORT) -> dict:
+    ip = validate_ip(receiver_ip)
+    try:
+        validate_password(new_password)
+        return _request_json(ip, port, "/auth/change-password", auth_headers(token),
+                             body=dict(old_password=old_password, new_password=new_password))
+    except AccountError as exc:
+        raise TransferError(str(exc), exc.status) from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise TransferError("修改密码时连接失败，请检查网络。", 503) from exc
+
+
 def _check_receipt(result: dict, metadata: Submission) -> dict:
     if (result.get("size") != metadata.size or not isinstance(result.get("sha256"), str)
             or not hmac.compare_digest(result["sha256"], metadata.sha256)):
@@ -423,13 +485,14 @@ def _check_receipt(result: dict, metadata: Submission) -> dict:
     return result
 
 
-def _send_stream(ip, port, stream, metadata, emit, check_cancel):
-    connection = http.client.HTTPConnection(ip, port, timeout=8.0)
+def _send_stream(ip, port, stream, metadata, emit, check_cancel, token):
+    connection = http.client.HTTPConnection(ip, port, timeout=8)
     try:
         stream.seek(0)
         connection.connect()
         connection.sock.settimeout(30.0)
         connection.putrequest("POST", "/upload")
+        connection.putheader("Authorization", auth_headers(token)["Authorization"])
         connection.putheader(METADATA_HEADER, metadata.encode())
         connection.putheader("Content-Type", "application/octet-stream")
         connection.putheader("Content-Length", str(metadata.size))
@@ -463,13 +526,14 @@ def _send_stream(ip, port, stream, metadata, emit, check_cancel):
         connection.close()
 
 
-def _send_status(ip, port, metadata, data, status_sha256):
+def _send_status(ip, port, metadata, data, status_sha256, token):
     connection = http.client.HTTPConnection(ip, port, timeout=30)
     try:
         connection.request("POST", "/activity", body=data, headers={
             METADATA_HEADER: metadata.encode(), STATUS_HASH_HEADER: status_sha256,
             "Content-Type": "application/json; charset=utf-8", "Content-Length": str(len(data)),
             "Connection": "close",
+            **auth_headers(token),
         })
         result = _response_json(connection.getresponse())
         if (result.get("upload_id") != metadata.upload_id
@@ -488,7 +552,7 @@ def upload_file(file_path: str | Path, student_account: str, receiver_ip: str, *
                 port: int = PORT, retries: int = 2, retry_delay: float = 1.0,
                 progress: Callable[[Progress], None] | None = None,
                 cancel: threading.Event | None = None,
-                status_file: str | Path | None = None) -> dict:
+                status_file: str | Path | None = None, session_token: str | None = None) -> dict:
     """上传一个 ZIP / RAR 文件，包含自动重试、流式发送、完整性确认。
 
     retries 是首次失败后的重试次数，0 表示不重试，最大 10。
@@ -496,9 +560,11 @@ def upload_file(file_path: str | Path, student_account: str, receiver_ip: str, *
     重试整文件重传，同一调用保留提交编号、文件描述符及已计算的 SHA256。
     status_file 可附带监控日志快照；作业确认后发送日志，全部成功才发出 done。
     日志失败时重试同一提交，不重复上传已经确认保存的作业。
+    session_token 须由 login_student 取得。
     """
     ip = validate_ip(receiver_ip)
     validate_student_account(student_account)
+    headers = auth_headers(session_token)
     if type(retries) is not int or not 0 <= retries <= 10:
         raise TransferError("重试次数须为 0–10 的整数。")
     if type(retry_delay) not in (int, float) or not 0 <= retry_delay <= 30:
@@ -555,6 +621,8 @@ def upload_file(file_path: str | Path, student_account: str, receiver_ip: str, *
                     health = _request_json(ip, port, "/health")
                     if health.get("protocol") != PROTOCOL:
                         raise TransferError("该地址不是兼容的教师接收端，请核对 IP 和程序版本。")
+                    if AUTH_FEATURE not in health.get("features", []) or health.get("authentication_required") is not True:
+                        raise TransferError("教师端尚未启用账号密码验证，请先更新教师端程序。")
                     if status_data is not None and STATUS_FEATURE not in health.get("features", []):
                         raise TransferError("教师接收端尚不支持监控日志，请先更新教师端 upload.py 和 monitoring.py。")
                     if history_required and HISTORY_FEATURE not in health.get("features", []):
@@ -582,20 +650,20 @@ def upload_file(file_path: str | Path, student_account: str, receiver_ip: str, *
                     if (before.st_size, before.st_mtime_ns) != (current.st_size, current.st_mtime_ns):
                         raise TransferError("文件在传输过程中被修改，请关闭编辑软件后重新提交。")
                     emit("connecting", 0, 0, "正在确认教师端提交状态")
-                    state = _request_json(ip, port, "/status", {METADATA_HEADER: metadata.encode()})
+                    state = _request_json(ip, port, "/status", {METADATA_HEADER: metadata.encode(), **headers})
                     if state.get("state") == "completed":
                         result = _check_receipt(state, metadata)
                     elif state.get("state") == "receiving":
                         raise TransferError("上一次上传仍在接收或清理，请稍后重试。", 409, True)
                     elif state.get("state") == "ready":
-                        result = _send_stream(ip, port, stream, metadata, emit, check_cancel)
+                        result = _send_stream(ip, port, stream, metadata, emit, check_cancel, session_token)
                     else:
                         raise TransferError("教师端提交状态响应异常。")
                     archive_saved = True
                     if status_data is not None:
                         check_cancel()
                         emit("status", size, 0, "作业文件已保存，正在提交软件使用与告警日志")
-                        receipt = _send_status(ip, port, metadata, status_data, status_sha256)
+                        receipt = _send_status(ip, port, metadata, status_data, status_sha256, session_token)
                         result.update(status_log_saved=True, status_filename=receipt["status_filename"],
                                       status_sha256=status_sha256)
                     emit("done", size, 0, "作业提交成功（监控日志已提交）" if status_data is not None else "作业提交成功")
@@ -639,6 +707,7 @@ class UploadJob:
     student_account: str
     receiver_ip: str
     status_file: str | Path | None = None
+    session_token: str | None = field(default=None, repr=False)
 
 
 def upload_files(jobs: Iterable[UploadJob], *, max_workers: int = 4, port: int = PORT,
@@ -661,7 +730,7 @@ def upload_files(jobs: Iterable[UploadJob], *, max_workers: int = 4, port: int =
         try:
             return upload_file(job.file_path, job.student_account, job.receiver_ip, port=port,
                                retries=retries, retry_delay=retry_delay, progress=progress, cancel=cancel,
-                               status_file=job.status_file)
+                               status_file=job.status_file, session_token=job.session_token)
         except TransferError as exc:
             return {"ok": False, "student_account": job.student_account,
                     "filename": Path(job.file_path).name, "message": exc.message}
@@ -685,7 +754,10 @@ class ReceiverServer(ThreadingHTTPServer):
     request_queue_size = 128
 
     def __init__(self, save_dir: str | Path, host: str = "0.0.0.0", port: int = PORT,
-                 progress: Callable[[Progress], None] | None = None):
+                 progress: Callable[[Progress], None] | None = None,
+                 accounts_db: str | Path = DEFAULT_DB):
+        self.accounts = AccountDatabase(accounts_db)
+        self.auth = Authenticator(self.accounts)
         self.storage = SafeStorage(Path(save_dir))
         self.progress_callback = progress
         self.stopping = threading.Event()
@@ -954,7 +1026,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.rfile = io.BufferedReader(_CancellableReader(self.connection, self.server))
 
     def log_message(self, fmt, *args):
-        logger.debug("%s " + fmt, self.client_address[0], *args)
+        # 请求行可能包含恶意输入；日志不记录请求内容或认证头。
+        logger.debug("教师端请求，来源：%s", self.client_address[0])
 
     def reply(self, status: int, fields: dict):
         body = json.dumps(fields, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -994,19 +1067,78 @@ class _Handler(BaseHTTPRequestHandler):
                         features.append(HISTORY_FEATURE)
                 except ImportError:
                     features = []
-                self.reply(200, {"ok": True, "protocol": PROTOCOL, "port": self.server.server_port, "features": features})
+                features.append(AUTH_FEATURE)
+                self.reply(200, {"ok": True, "protocol": PROTOCOL, "port": self.server.server_port,
+                                 "features": features, "authentication_required": True})
             elif self.path == "/status":
                 values = self.headers.get_all(METADATA_HEADER, [])
                 if len(values) != 1:
                     raise TransferError("提交信息缺失或重复。")
                 submission = Submission.decode(values[0])
+                self.require_auth(submission.student_account)
                 self.reply(200, self.server.submission_status(submission))
             else:
                 raise TransferError("接口不存在。", 404)
         except TransferError as exc:
             self.reply_safely(exc.status, exc.message, exc.retryable)
+        except AccountError as exc:
+            self.reply_safely(exc.status, str(exc))
+        except sqlite3.Error:
+            self.reply_safely(503, "账号数据库暂时不可用，请联系教师。")
         except OSError:
             self.close_connection = True
+
+    def read_token(self) -> str:
+        values = self.headers.get_all("Authorization", [])
+        if len(values) != 1 or not re.fullmatch(r"Bearer [A-Za-z0-9_-]{43}", values[0]):
+            raise TransferError("请先使用正确的账号密码登录学生端。", 401)
+        return values[0][7:]
+
+    def require_auth(self, account: str | None = None):
+        return self.server.auth.authorize(self.read_token(), account)
+
+    def receive_auth(self):
+        try:
+            if self.server.stopping.is_set():
+                raise TransferError("教师已停止接收。", 503)
+            if self.path == "/auth/logout":
+                self.server.auth.logout(self.read_token())
+                self.reply(200, {"ok": True, "message": "已退出登录"})
+                return
+            if self.headers.get_all("Content-Type", []) != ["application/json; charset=utf-8"]:
+                raise TransferError("登录信息须为 UTF-8 JSON。")
+            lengths = self.headers.get_all("Content-Length", [])
+            if (len(lengths) != 1 or not re.fullmatch(r"[1-9][0-9]{0,3}", lengths[0])
+                    or int(lengths[0]) > 4096):
+                raise TransferError("登录信息长度无效。")
+            if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Encoding"):
+                raise TransferError("不支持此登录传输编码。")
+            raw = self.rfile.read(int(lengths[0]))
+            if len(raw) != int(lengths[0]):
+                raise TransferError("登录信息不完整。")
+            try:
+                fields = json.loads(raw)
+            except (ValueError, UnicodeError, RecursionError) as exc:
+                raise TransferError("登录信息格式无效。") from exc
+            expected = {"student_account", "password"} if self.path == "/auth/login" else {"old_password", "new_password"}
+            if not isinstance(fields, dict) or set(fields) != expected:
+                raise TransferError("登录信息字段无效。")
+            if self.path == "/auth/login":
+                result = self.server.auth.login(fields["student_account"], fields["password"])
+            else:
+                account = self.require_auth()
+                self.server.accounts.change_password(account, fields["old_password"], fields["new_password"])
+                result = {"ok": True, "message": "密码修改成功，请使用新密码重新登录。"}
+            self.reply(200, result)
+        except (AccountError, TransferError) as exc:
+            self.reply_safely(exc.status, str(exc))
+        except sqlite3.Error:
+            self.reply_safely(503, "账号数据库暂时不可用，请联系教师。")
+        except OSError:
+            self.reply_safely(408, "登录连接中断，请重试。")
+        except Exception:
+            # 不输出认证请求或局部变量，避免泄露密码。
+            self.reply_safely(500, "教师端身份验证失败，请联系教师。")
 
     def read_submission(self) -> Submission:
         values = self.headers.get_all(METADATA_HEADER, [])
@@ -1022,6 +1154,9 @@ class _Handler(BaseHTTPRequestHandler):
         return submission
 
     def do_POST(self):
+        if self.path in ("/auth/login", "/auth/logout", "/auth/change-password"):
+            self.receive_auth()
+            return
         if self.path == "/activity":
             self.receive_activity()
             return
@@ -1042,6 +1177,7 @@ class _Handler(BaseHTTPRequestHandler):
             if self.server.stopping.is_set():
                 raise TransferError("教师已停止接收。", 503)
             submission = self.read_submission()
+            self.require_auth(submission.student_account)
             task_id = submission.upload_id
             completed = self.server.claim_submission(submission)
             if completed:
@@ -1077,6 +1213,11 @@ class _Handler(BaseHTTPRequestHandler):
         except TransferError as exc:
             emit("failed", exc.message)
             self.reply_safely(exc.status, exc.message, exc.retryable)
+        except AccountError as exc:
+            emit("failed", str(exc))
+            self.reply_safely(exc.status, str(exc))
+        except sqlite3.Error:
+            self.reply_safely(503, "账号数据库暂时不可用，请联系教师。")
         except TimeoutError:
             stopped = self.server.stopping.is_set()
             message = "教师已停止接收，未完成上传已中止。" if stopped else "超过 120 秒未收到数据，上传已中止，请重新提交。"
@@ -1116,6 +1257,7 @@ class _Handler(BaseHTTPRequestHandler):
             if len(values) != 1:
                 raise TransferError("监控日志缺少有效的作业提交信息。")
             submission = Submission.decode(values[0])
+            self.require_auth(submission.student_account)
             state = self.server.submission_status(submission)
             if state.get("state") != "completed":
                 raise TransferError("对应作业尚未完整保存，不能接收其监控日志。", 409, True)
@@ -1153,6 +1295,10 @@ class _Handler(BaseHTTPRequestHandler):
                              "status_sha256": status_sha256})
         except TransferError as exc:
             self.reply_safely(exc.status, exc.message, exc.retryable)
+        except AccountError as exc:
+            self.reply_safely(exc.status, str(exc))
+        except sqlite3.Error:
+            self.reply_safely(503, "账号数据库暂时不可用，请联系教师。")
         except TimeoutError:
             self.reply_safely(408, "监控日志接收超时，请重新提交。", True)
         except OSError as exc:
@@ -1189,6 +1335,7 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     receive = commands.add_parser("receive", help="在教师电脑启动接收")
     receive.add_argument("--save-dir", required=True, help="保存目录，每个学号使用一个子目录")
+    receive.add_argument("--accounts-db", default=str(DEFAULT_DB), help="教师本地学生账号库路径")
     send = commands.add_parser("send", help="上传一个或多个压缩文件")
     send.add_argument("--ip", required=True, help="教师电脑 IPv4")
     send.add_argument("--student-account", "--student-id", dest="student_account", required=True, help="学生学号")
@@ -1200,12 +1347,16 @@ def main() -> int:
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
     server = None
+    session = None
     try:
         if args.command == "receive":
-            server = ReceiverServer(args.save_dir, progress=_show_progress)
+            server = ReceiverServer(args.save_dir, progress=_show_progress, accounts_db=args.accounts_db)
             addresses = local_ipv4_addresses()
             print("教师电脑 IPv4：" + (" / ".join(addresses) if addresses else "未检测到，请通过 ipconfig 查看"))
             print(f"固定端口：{PORT}\n保存目录：{server.storage.root}\n已开始接收，按 Ctrl+C 停止。", flush=True)
+            print(f"学生账号库：{server.accounts.path}\n已启用账号密码验证。", flush=True)
+            if not server.accounts.list_students():
+                print("账号库为空，请先在教师电脑运行 python accounts.py add --student-account 学号 创建账号。", flush=True)
             server.serve_forever()
             return 0
         validate_student_account(args.student_account)
@@ -1216,17 +1367,28 @@ def main() -> int:
                 status_file = candidate
         if status_file is not None:
             print(f"将随作业提交软件使用与告警日志：{status_file}", flush=True)
+        import getpass
+        password = getpass.getpass("学生账号密码：")
+        session = login_student(args.ip, args.student_account, password)
+        del password
         options = dict(retries=args.retries, retry_delay=args.retry_delay, progress=_show_progress)
         if len(args.file) == 1:
-            results = [upload_file(args.file[0], args.student_account, args.ip, status_file=status_file, **options)]
+            results = [upload_file(args.file[0], args.student_account, args.ip, status_file=status_file,
+                                   session_token=session["token"], **options)]
         else:
-            jobs = [UploadJob(path, args.student_account, args.ip, status_file) for path in args.file]
+            jobs = [UploadJob(path, args.student_account, args.ip, status_file, session["token"]) for path in args.file]
             results = upload_files(jobs, max_workers=args.workers, **options)
         for result in results:
             print(f"{result['filename']}：" + ("作业提交成功" if result["ok"] else result["message"]), flush=True)
         return 0 if all(result["ok"] for result in results) else 1
     except TransferError as exc:
         print(exc.message, file=sys.stderr)
+        return 1
+    except (AccountError, sqlite3.Error):
+        print("账号数据库无法打开，请检查教师端数据库路径、权限和版本。", file=sys.stderr)
+        return 1
+    except EOFError:
+        print("未输入密码，已取消上传。", file=sys.stderr)
         return 1
     except OSError:
         print("启动接收失败：请检查保存目录权限及端口 9000 是否被占用。", file=sys.stderr)
@@ -1237,6 +1399,11 @@ def main() -> int:
     finally:
         if server:
             server.close()
+        if session is not None:
+            try:
+                logout_student(args.ip, session["token"])
+            except TransferError:
+                pass  # 网络中断时令牌只能等待到期；本进程不再保留令牌。
 
 
 if __name__ == "__main__":

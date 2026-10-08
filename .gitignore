@@ -4,5 +4,7 @@ __pycache__/
 .venv/
 test/artifacts/
 requirements.txt
-test/
+test/*
+!test/test_authentication.py
 接收作业/
+teacher_data/
